@@ -1,20 +1,33 @@
 # @package _global_
+
+method_name: dp
 action_sequence: 20
+num_train_steps: 20000
 
 method:
-  _target_: robobase.method.diffusion.Diffusion
-  is_rl: false
+  _target_: src.methods.dp.DiffusionPolicy
   lr: 1e-4
-  num_train_steps: ${num_pretrain_steps}
-  num_diffusion_iters: 50
+  weight_decay: 1e-6
+  num_train_steps: ${num_train_steps}
+  num_diffusion_iters: 50  # train and test diffusion steps
   adaptive_lr: true
   actor_grad_clip: null
+  use_lang_cond: False
+  action_order: FORWARD
+  action_padding: zero
+  mtp: false
+  keyframe_only: false
+
+  # Action dimensions - must match env
+  action_sequence: ${action_sequence}
+  action_mode: ${env.action_mode}
+  execution_length: ${execution_length}
+  action_dim: 8
 
   actor_model:
-    _target_: robobase.models.diffusion_models.ConditionalUnet1D  # film_unet
+    _target_: src.models.diffusion_models.ConditionalUnet1D
     _partial_: true
-    input_shapes: ???
-    output_shape: ???
+    # input_shapes and output_shape are set at runtime by DiffusionPolicy
     sequence_length: ${action_sequence}
     diffusion_step_embed_dim: 256
     down_dims: [256, 512, 1024]
@@ -22,13 +35,13 @@ method:
     n_groups: 8
 
   encoder_model:
-    _target_: robobase.models.ResNetEncoder
+    _target_: src.methods.dp.ImageEncoder
     _partial_: true
-    input_shape: ???
-    model: resnet18
-
-  view_fusion_model:
-    _target_: robobase.models.FusionMultiCamFeature
-    _partial_: true
-    input_shape: ???
-    mode: flatten
+    input_shape: [4, 3, 128, 128]  # [views, channels, height, width]
+    hidden_dim: 512
+    position_embedding: "sine"
+    lr_backbone: 1e-5
+    masks: False
+    backbone: "resnet18"
+    dilation: False
+    use_frozen_bn: True

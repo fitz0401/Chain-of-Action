@@ -12,5 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# DP method will be implemented here
-__all__ = [] 
+from src.methods.dp.diffusion import DiffusionPolicy, ImageEncoder
+
+__all__ = ["DiffusionPolicy", "ImageEncoder"]

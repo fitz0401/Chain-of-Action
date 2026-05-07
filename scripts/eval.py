@@ -24,10 +24,19 @@ from src.workspace import Workspace
 import hydra
 import torch
 
+
+def load_checkpoint(snapshot_path):
+    # Checkpoints in this project contain config objects, so load the full pickle payload.
+    try:
+        return torch.load(snapshot_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        # Backward compatibility for older PyTorch versions without weights_only.
+        return torch.load(snapshot_path, map_location="cpu")
+
 @hydra.main(config_path="../src/cfgs/", config_name="launch", version_base=None)
 def main(cfg):
     # load the checkpoint
-    checkpoint = torch.load(cfg.snapshot, map_location="cpu")
+    checkpoint = load_checkpoint(cfg.snapshot)
 
     # merge the cfg from checkpoint and the cfg from command line
     cfg_ckpt = checkpoint["config"]

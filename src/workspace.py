@@ -569,8 +569,14 @@ class Workspace:
             print(f"Warning: Checkpoint file {checkpoint_path} does not exist")
             return None
 
-        # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        # Load checkpoint: this project stores OmegaConf objects in checkpoints.
+        try:
+            checkpoint = torch.load(
+                checkpoint_path, map_location="cpu", weights_only=False
+            )
+        except TypeError:
+            # Backward compatibility for older PyTorch versions.
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
         # Compatible with old ckpt without cfg field
         self.cfg_ckpt = checkpoint.get("config", None)
         if self.cfg_ckpt is None:

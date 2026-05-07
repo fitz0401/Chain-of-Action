@@ -1,20 +1,22 @@
 # @package _global_
 
 method_name: act
+action_sequence: 20  # default, overridden at runtime by workspace
+
 method:
   _target_: src.methods.act.ACT
-  device: ${device}
   lr: 1e-4
   lr_backbone: 1e-5
   weight_decay: 1e-4
-  num_train_steps: ${num_pretrain_steps}
+  num_train_steps: ${num_train_steps}
   adaptive_lr: true
-  use_lang_cond: True
+  use_lang_cond: False
   loss_type: l1
+  actor_grad_clip: null
 
   # modeling settings
+  action_sequence: ${action_sequence}
   action_order: FORWARD
-  action_sequence: 20 # action_chunk size
   action_padding: zero
   mtp: false
   action_mode: ${env.action_mode}
@@ -29,7 +31,7 @@ method:
     dim_feedforward: 3200
     dropout: 0.1
     nheads: 8
-    num_queries: 100
+    num_queries: ${action_sequence}  # must match action_sequence
     pre_norm: false
     state_dim: 8
     action_dim: 8
@@ -39,7 +41,7 @@ method:
   encoder_model:
     _target_: src.methods.act.ImageEncoder
     _partial_: true
-    input_shape: [2, 3, 128, 128]  # [views, channels, height, width]
+    input_shape: [4, 3, 128, 128]  # [views, channels, height, width]
     hidden_dim: ${method.actor_model.hidden_dim}
     position_embedding: "sine"
     lr_backbone: ${method.lr_backbone}

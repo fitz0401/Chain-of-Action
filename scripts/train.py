@@ -16,13 +16,15 @@
 """
 Training script for Chain-of-Action models.
 """
-
+import sys
+sys.path.append(".")
 import hydra
 from src.workspace import Workspace
 
 
 @hydra.main(config_path="../src/cfgs/", config_name="launch", version_base=None)
 def main(cfg):
+    cfg.wandb.use = False
     workspace = Workspace(cfg, train=True)
     workspace.loop()
 
