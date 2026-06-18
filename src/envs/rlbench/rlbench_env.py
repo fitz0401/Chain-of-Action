@@ -537,6 +537,17 @@ class RLBenchEnvFactory(EnvFactory):
                         cfg.temporal_ensemble_gain,
                         action_order="REVERSE"
                     )
+                elif cfg.method_name == "bip":
+                    # BIP act() returns dp_action_sequence (e.g. 20) actions, not the
+                    # CoA variable sequence length stored in cfg.action_sequence.
+                    env = TemporalEnsemble(
+                        env,
+                        cfg.method.dp_action_sequence,
+                        cfg.env.episode_length,
+                        cfg.execution_length,
+                        cfg.temporal_ensemble,
+                        cfg.temporal_ensemble_gain,
+                    )
                 else:
                     env = TemporalEnsemble(
                         env,
@@ -644,7 +655,8 @@ class RLBenchEnvFactory(EnvFactory):
             )
 
         # Split each trajectory into a list of sub-trajectories according to the keyframe action.
-        if cfg.method_name == "coa":
+        if cfg.method_name in ("coa", "bip"):
+            # BIP uses the same keyframe-split data as CoA.
             demos = self._traj_split(raw_demos)
             action_sequence = self._update_action_sequence_length(cfg, demos)
         else:

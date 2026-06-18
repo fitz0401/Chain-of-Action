@@ -253,8 +253,10 @@ class RLBenchDataset(Dataset):
 
         if self.cfg.method_name == "coa":
             return self.get_sample_coa(episode_idx)
-        elif self.cfg.method_name == "act" or self.cfg.method_name == "dp":
+        elif self.cfg.method_name in ("act", "dp"):
             return self.get_sample(episode_idx)
+        elif self.cfg.method_name == "bip":
+            return self.get_sample_bip(episode_idx)
         else:
             raise ValueError(f"Unknown method name: {self.cfg.method_name}")
         
@@ -409,6 +411,58 @@ class RLBenchDataset(Dataset):
         
         return sample
 
+
+
+    def get_sample_bip(self, episode_idx: int) -> dict:
+        """
+        Dataset sample for BIP.
+
+        Keys returned:
+          'action'    : (L, 8)        CoA-REVERSE planner target — full remaining
+                                       sub-trajectory [a_T, a_{T-1}, ..., a_idx] padded
+                                       to L = max sub-trajectory length. Position 0 is
+                                       the keyframe; the model reads [:m] as milestone.
+          'is_pad'    : (L,)          padding mask for the planner target
+          'action_dp' : (dp_chunk, 8) DP-FORWARD executed chunk [a_{idx+1}, ..., a_{idx+dp_chunk}];
+                                       steps past the keyframe hold the keyframe pose a_T.
+        """
+        episode = self._demos[episode_idx]
+
+        actions = episode[ActionModeType[self.cfg.env.action_mode].value]
+        ep_len  = len(actions)
+        max_idx = ep_len - 1
+
+        idx = 0 if (self.cfg.debug or ep_len <= 1) else np.random.randint(0, max_idx)
+
+        sample = self.get_observation(episode, idx)
+
+        dp_chunk = self.cfg.method.dp_action_sequence
+
+        # ── CoA planner target: full remaining sub-trajectory in REVERSE order ──
+        # Identical to CoA: from current idx up to the keyframe, reversed so that
+        # position 0 = a_T (keyframe). The model takes the first m as the milestone.
+        action_seq, is_pad = self.get_action_coa(actions, max_idx, idx)
+        sample['action'] = action_seq
+        sample['is_pad'] = is_pad
+
+        # ── DP controller target: FORWARD chunk [a_{idx+1}, ..., a_{idx+dp_chunk}] ──
+        # Beyond the keyframe, HOLD the keyframe pose a_T (not zeros) so the controller
+        # drives to the goal and stays — zeros would denormalize to a center pose and,
+        # since temporal ensembling only filters exactly-zero entries, drag the executed
+        # action away from the keyframe (a jump/drift right at the keyframe).
+        keyframe_action = actions[max_idx]
+        fwd = np.zeros((dp_chunk, actions.shape[-1]), dtype=np.float32)
+        for i in range(dp_chunk):
+            t = idx + 1 + i
+            fwd[i] = actions[t] if t < ep_len else keyframe_action
+        sample['action_dp'] = fwd
+
+        if self.cfg.method.use_lang_cond:
+            sample['desc'] = sample['desc'].squeeze(0)
+
+        del sample[ActionModeType[self.cfg.env.action_mode].value]
+        sample = self.convert_dtype(sample)
+        return sample
 
 
 @hydra.main(config_path="../cfgs/", config_name="launch_act", version_base=None)

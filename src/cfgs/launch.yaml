@@ -2,7 +2,7 @@
 defaults:
   - base: base_config
   - env: rlbench
-  - method: dp
+  - method: bip
   - _self_
   - override env: episode_length
 

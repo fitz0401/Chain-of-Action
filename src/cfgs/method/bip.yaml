@@ -1,0 +1,96 @@
+# @package _global_
+#
+# BIP — Bidirectional Policy
+#
+# Shared visual backbone -> two heads:
+#   CoA-REVERSE planner : original CoA, generates the full remaining sub-trajectory
+#                         in REVERSE order (keyframe -> current). num_queries is the
+#                         runtime-resolved max sub-trajectory length (same as CoA).
+#   DP-FORWARD control  : original DP, predicts the executed chunk, conditioned on the
+#                         m near-goal actions of the planner (projected) + pooled image.
+#
+# Uses the same keyframe-split data as CoA.
+
+method_name: bip
+action_sequence: variable     # resolved at runtime to max sub-trajectory length
+num_train_steps: 20000
+
+method:
+  _target_: src.methods.bip.BIP
+
+  # ── BIP head params ──────────────────────────────────────────────────────────
+  m: 15                          # near-goal milestone length (planner -> controller)
+  dp_action_sequence: 20         # executed forward chunk length (divisible by 4)
+  action_dim: 8
+  hidden_dim: 512
+  milestone_embed_dim: 128       # milestone projection width
+  num_diffusion_iters: 50
+
+  # milestone scheduled sampling: p = max(p_min, 1 - step/schedule_steps)
+  milestone_schedule_steps: ${num_train_steps}   # anneal GT->prediction over training
+  milestone_p_min: 0.0                            # final reliance on CoA prediction
+
+  # ── Optimiser ────────────────────────────────────────────────────────────────
+  lr: 1e-4
+  lr_backbone: 1e-5
+  weight_decay: 1e-4
+  num_train_steps: ${num_train_steps}
+  adaptive_lr: true
+  actor_grad_clip: 1.0
+
+  # ── CoA loss types ───────────────────────────────────────────────────────────
+  loss_type: l1
+  latent_loss_type: l1
+  execute_threshold: 0.01
+  execution_length: ${execution_length}
+
+  # ── Fields consumed by dataset / env factory (mirror CoA) ──────────────────────
+  action_order: REVERSE
+  action_padding: zero
+  mtp: false
+  keyframe_only: false
+  full_traj_training: false
+  action_mode: ${env.action_mode}
+  use_lang_cond: false
+
+  # ── Shared image encoder (CoA spatial encoder) ─────────────────────────────────
+  encoder_model:
+    _target_: src.methods.coa.coa.ImageEncoder
+    _partial_: true
+    input_shape: [4, 3, 128, 128]
+    hidden_dim: ${method.hidden_dim}
+    position_embedding: "sine"
+    lr_backbone: ${method.lr_backbone}
+    masks: false
+    backbone: "resnet18"
+    dilation: false
+    use_frozen_bn: true
+    use_lang_cond: false
+
+  # ── CoA planner actor (REVERSE, full sequence) ─────────────────────────────────
+  # action_order / execute_threshold / execution_length injected in BIP.__init__
+  coa_actor_model:
+    _target_: src.methods.coa.coa.ActorModel
+    _partial_: true
+    num_queries: ${action_sequence}   # runtime-resolved max sub-trajectory length
+    hidden_dim: ${method.hidden_dim}
+    enc_layers: 4
+    dec_layers: 6
+    dim_feedforward: 3200
+    dropout: 0.1
+    nheads: 8
+    nmtpheads: 0
+    pre_norm: true
+    state_dim: 8
+    action_dim: ${method.action_dim}
+    use_lang_cond: false
+
+  # ── DP controller UNet (input_shapes / output_shape injected at runtime) ───────
+  dp_actor_model:
+    _target_: src.models.diffusion_models.ConditionalUnet1D
+    _partial_: true
+    sequence_length: ${method.dp_action_sequence}
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
