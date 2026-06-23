@@ -4,27 +4,19 @@ BIP — Bidirectional Policy.
 A single shared visual backbone feeds two action heads:
 
   1. CoA-REVERSE head (planner) — identical to coa.py.
-        Autoregressively generates the *full* remaining sub-trajectory in
-        REVERSE order (keyframe a_T -> current a_idx). The m steps closest to
-        the goal, a_hat[:, :m] = [a_T, a_{T-1}, ..., a_{T-m+1}], form the
-        "milestone" that anchors the forward head.
+        Autoregressively generates the full remaining sub-trajectory in REVERSE
+        order (keyframe a_T -> current a_idx).
 
   2. DP-FORWARD head (controller) — identical to dp.py.
         A conditional diffusion model that predicts the immediate forward chunk
-        [a_{idx+1}, ..., a_{idx+dp_chunk}] actually executed on the robot.
-        Conditioned on (pooled image feature, projected milestone).
+        [a_{idx+1}, ..., a_{idx+dp_chunk}] actually executed on the robot,
+        conditioned ONLY on the pooled image feature (plain DP — no milestone).
 
-Train / test milestone consistency
-----------------------------------
-At inference only the CoA *prediction* is available, so during training the
-milestone fed to the DP head is a scheduled mix of ground truth and the
-(detached) CoA prediction:
-
-        p         = max(p_min, 1 - step / schedule_steps)
-        milestone = p * GT + (1 - p) * CoA_pred.detach()
-
-p starts at 1 (pure teacher forcing) and anneals towards p_min, so the DP head
-gradually learns to trust the planner's own output — matching inference.
+The two heads are trained independently (each with its own loss). They are
+coupled ONLY at inference, through CoA-guided diffusion: while the DP head
+denoises from pure noise, every DDIM step blends the predicted clean sample
+toward the CoA guess for the same chunk (reconstruction guidance). See
+`_coa_guess_chunk` and `Actor.infer_guided`.
 """
 
 import torch
@@ -60,14 +52,13 @@ class BIP(BaseMethod):
         adaptive_lr: bool,
         actor_grad_clip,
         # BIP params
-        m: int,
         dp_action_sequence: int,
         action_dim: int,
         hidden_dim: int,
-        milestone_embed_dim: int,
-        milestone_schedule_steps: int,
-        milestone_p_min: float,
         num_diffusion_iters: int,
+        # CoA-guided diffusion (inference only)
+        use_coa_guidance: bool,
+        guidance_strength: float,
         # CoA params injected at actor construction time
         execute_threshold: float,
         execution_length: int,
@@ -77,14 +68,13 @@ class BIP(BaseMethod):
     ):
         super().__init__(*args, **kwargs)
 
-        self.m                        = m
-        self.dp_action_sequence       = dp_action_sequence
-        self.action_dim               = action_dim
-        self.loss_type                = loss_type
-        self.latent_loss_type         = latent_loss_type
-        self.actor_grad_clip          = actor_grad_clip
-        self.milestone_schedule_steps = milestone_schedule_steps
-        self.milestone_p_min          = milestone_p_min
+        self.dp_action_sequence = dp_action_sequence
+        self.action_dim         = action_dim
+        self.loss_type          = loss_type
+        self.latent_loss_type   = latent_loss_type
+        self.actor_grad_clip    = actor_grad_clip
+        self.use_coa_guidance   = use_coa_guidance
+        self.guidance_strength  = guidance_strength
 
         self.device = (
             self.accelerator.device
@@ -102,14 +92,8 @@ class BIP(BaseMethod):
             execution_length=execution_length,
         ).to(self.device)
 
-        # ── Conditioning projections for the DP head ─────────────────────────
-        # milestone: the m near-goal actions -> a single embedding
-        self.milestone_proj = nn.Linear(m * action_dim, milestone_embed_dim).to(self.device)
-        # pooled visual feature -> its own learnable space
+        # ── DP controller head (plain DP: image-conditioned only) ─────────────
         self.dp_visual_proj = nn.Linear(hidden_dim, hidden_dim).to(self.device)
-
-        # ── DP controller head ────────────────────────────────────────────────
-        dp_feature_dim = hidden_dim + milestone_embed_dim
         self.dp_noise_scheduler = DDIMScheduler(
             num_train_timesteps=num_diffusion_iters,
             beta_schedule="squaredcos_cap_v2",
@@ -117,7 +101,7 @@ class BIP(BaseMethod):
             prediction_type="epsilon",
         )
         unet = dp_actor_model(
-            input_shapes={"actions": (action_dim,), "features": (dp_feature_dim,)},
+            input_shapes={"actions": (action_dim,), "features": (hidden_dim,)},
             output_shape=action_dim,
             sequence_length=dp_action_sequence,
         ).to(self.device)
@@ -130,8 +114,6 @@ class BIP(BaseMethod):
         ).to(self.device)
 
         self.img_normalizer = tvf.Normalize(mean=VISUAL_OBS_MEAN, std=VISUAL_OBS_STD)
-        # checkpointed training-step counter that drives the milestone schedule
-        self.register_buffer("_step", torch.zeros((), dtype=torch.long))
 
         # ── Unified AdamW (backbone group at lower lr; exclude DP EMA shadow) ──
         param_dicts = [
@@ -161,45 +143,28 @@ class BIP(BaseMethod):
         # (b, hidden_dim, h, w) -> (b, hidden_dim)
         return self.dp_visual_proj(img_feat.mean(dim=[-2, -1]))
 
-    def _milestone_embed(self, seg: torch.Tensor) -> torch.Tensor:
-        # (b, m, action_dim) -> (b, milestone_embed_dim)
-        return self.milestone_proj(seg.reshape(seg.shape[0], -1))
-
     @staticmethod
     def _strip_mtp(a: torch.Tensor) -> torch.Tensor:
         return a[:, :, 0, :] if a.dim() == 4 else a
 
-    def _milestone(self, a_hat: torch.Tensor, is_pad: torch.Tensor = None) -> torch.Tensor:
-        """Build the m-step near-goal milestone in REVERSE order (pos 0 = keyframe a_T).
+    def _coa_guess_chunk(self, a_hat_coa: torch.Tensor) -> torch.Tensor:
+        """CoA's guess for the DP forward chunk [a_{idx+1}, ..., a_{idx+dp_chunk}].
 
-        Any step beyond the real sub-trajectory is filled with the *keyframe* action
-        (the goal pose), not zeros, so the DP conditioning stays smooth and meaningful
-        as the robot closes in on the keyframe.
-
-          - training : a_hat is full length L (>= m); is_pad[:, :m] marks the tail.
-          - inference: a_hat has the decoder's generated length k; keyframe-pad if k < m.
+        a_hat_coa is REVERSE (pos 0 = keyframe a_T, last valid = current a_idx). Flip
+        to forward [a_idx, a_{idx+1}, ...] and drop a_idx (the current action) to align
+        with action_dp. Keyframe-pad the tail if the planner generated fewer steps.
         """
-        keyframe = a_hat[:, 0:1]                      # a_T (always valid: pos 0)
-        if is_pad is not None:
-            seg = a_hat[:, :self.m]
-            pad = is_pad[:, :self.m].unsqueeze(-1)    # (b, m, 1), True = beyond traj
-            return torch.where(pad, keyframe, seg)
-        seq_len = a_hat.shape[1]
-        if seq_len >= self.m:
-            return a_hat[:, :self.m]
-        pad = keyframe.expand(-1, self.m - seq_len, -1)
-        return torch.cat([a_hat, pad], dim=1)
-
-    def _milestone_p(self) -> float:
-        if self.milestone_schedule_steps <= 0:
-            return self.milestone_p_min
-        frac = float(self._step.item()) / float(self.milestone_schedule_steps)
-        return max(self.milestone_p_min, 1.0 - frac)
+        fwd = torch.flip(a_hat_coa, dims=[1])             # [a_idx, a_{idx+1}, ..., a_T]
+        guess = fwd[:, 1:1 + self.dp_action_sequence]     # [a_{idx+1}, ..., a_{idx+dp_chunk}]
+        if guess.shape[1] < self.dp_action_sequence:
+            keyframe = a_hat_coa[:, 0:1]                  # a_T
+            pad = keyframe.expand(-1, self.dp_action_sequence - guess.shape[1], -1)
+            guess = torch.cat([guess, pad], dim=1)
+        return guess
 
     def training_mode(self, training: bool = True):
         self.encoder.train(training)
         self.coa_actor.train(training)
-        self.milestone_proj.train(training)
         self.dp_visual_proj.train(training)
         self.dp_actor.train(training)
 
@@ -220,16 +185,8 @@ class BIP(BaseMethod):
                 obs_feat, proprio, task_emb, action_coa, is_pad_coa, training=True,
             )
 
-            # milestone = scheduled mix of GT and detached CoA prediction;
-            # both keyframe-padded on the (is_pad) tail beyond the real trajectory.
-            gt_milestone   = self._milestone(action_coa, is_pad_coa)
-            pred_milestone = self._milestone(self._strip_mtp(a_hat_coa).detach(), is_pad_coa)
-            p = self._milestone_p()
-            milestone = p * gt_milestone + (1.0 - p) * pred_milestone
-
-            dp_features = torch.cat(
-                [self._pool_visual(img_feat), self._milestone_embed(milestone)], dim=-1,
-            )
+            # plain DP: image-conditioned only
+            dp_features = self._pool_visual(img_feat)
             noise_pred, noise = self.dp_actor(dp_features, batch["action_dp"])
             return a_hat_coa, x_hat, x_gt, action_coa, is_pad_coa, noise_pred, noise
 
@@ -237,11 +194,15 @@ class BIP(BaseMethod):
         a_hat_coa, _, _ = self.coa_actor(
             obs_feat, proprio, task_emb, None, None, training=False,
         )
-        milestone = self._milestone(self._strip_mtp(a_hat_coa))   # m near-goal, keyframe-padded
-        dp_features = torch.cat(
-            [self._pool_visual(img_feat), self._milestone_embed(milestone)], dim=-1,
-        )
-        a_hat_dp = self.dp_actor.infer(dp_features)           # (b, dp_chunk, 8)
+        a_hat_coa = self._strip_mtp(a_hat_coa)
+        dp_features = self._pool_visual(img_feat)
+        if self.use_coa_guidance:
+            # warm-start the diffusion from the CoA guess for this same chunk (SDEdit)
+            guess = self._coa_guess_chunk(a_hat_coa)          # (b, dp_chunk, 8)
+            a_hat_dp = self.dp_actor.infer_guided(
+                dp_features, guess, self.guidance_strength)
+        else:
+            a_hat_dp = self.dp_actor.infer(dp_features)        # (b, dp_chunk, 8)
         return a_hat_dp, a_hat_coa
 
     # ── Training update ─────────────────────────────────────────────────────────
@@ -286,21 +247,18 @@ class BIP(BaseMethod):
         self.dp_actor.ema.step(self.dp_actor.actor.parameters())
         self.dp_actor.ema.copy_to(self.dp_actor.ema_actor.parameters())
 
-        self._step += 1
-
         return {
             "total_loss":  total_loss.detach(),
             "coa_loss":    coa_loss.detach(),
             "latent_loss": latent_loss.detach(),
             "dp_loss":     dp_loss.detach(),
-            "milestone_p": torch.tensor(self._milestone_p(), device=self.device),
         }
 
     # ── Inference ────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def act(self, batch) -> BatchedActionSequence:
-        """Return the DP forward chunk (conditioned on the CoA milestone)."""
+        """Return the DP forward chunk (CoA-guided diffusion)."""
         self.training_mode(False)
         a_hat_dp, _ = self.forward(batch, training=False)
         return a_hat_dp

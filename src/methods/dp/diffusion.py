@@ -165,6 +165,54 @@ class Actor(nn.Module):
 
         return noisy_action
 
+    @torch.no_grad()
+    def infer_guided(
+        self, features: torch.Tensor, guess: torch.Tensor, strength: float,
+    ) -> torch.Tensor:
+        """Reconstruction-guided DDIM inference.
+
+        Denoise from pure noise (so the model fully expresses its own distribution)
+        but at EVERY step nudge the predicted clean sample x0 toward `guess` (the CoA
+        chunk), then re-derive the guided noise and take the DDIM step. This applies
+        the guess as guidance throughout generation rather than as a fixed warm-start.
+
+        `strength` in [0, 1] is the per-step blend weight:
+          - 0.0 : plain DP (guess ignored)            == infer()
+          - 1.0 : force x0 == guess at every step (lock to the CoA plan)
+        Args:
+            features: (b, feature_dim)
+            guess:    (b, seq, action_dim) guess in the same normalized space
+            strength: float in [0, 1]
+        Returns:
+            actions: (b, seq, action_dim)
+        """
+        w = float(max(min(strength, 1.0), 0.0))
+        b = features.shape[0]
+        self.noise_scheduler.set_timesteps(self.num_diffusion_iters)
+        alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(features.device)
+
+        sample = torch.randn(
+            (b, self.action_sequence, self.action_dim), device=features.device
+        )
+        for k in self.noise_scheduler.timesteps:
+            eps = self.ema_actor({
+                "actions": sample,
+                "features": features,
+                "timestep": k,
+            })
+            # predicted clean sample, then blend toward the guess
+            ab = alphas_cumprod[k]
+            sqrt_ab = ab.sqrt()
+            sqrt_1mab = (1.0 - ab).sqrt().clamp(min=1e-3)
+            x0 = (sample - sqrt_1mab * eps) / sqrt_ab
+            x0 = (1.0 - w) * x0 + w * guess
+            eps = (sample - sqrt_ab * x0) / sqrt_1mab          # re-derive guided noise
+            sample = self.noise_scheduler.step(
+                model_output=eps, timestep=k, sample=sample
+            ).prev_sample
+
+        return sample
+
 
 class DiffusionPolicy(BaseMethod):
     """Diffusion Policy agent for Chain-of-Action.

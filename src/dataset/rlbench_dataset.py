@@ -421,7 +421,8 @@ class RLBenchDataset(Dataset):
           'action'    : (L, 8)        CoA-REVERSE planner target — full remaining
                                        sub-trajectory [a_T, a_{T-1}, ..., a_idx] padded
                                        to L = max sub-trajectory length. Position 0 is
-                                       the keyframe; the model reads [:m] as milestone.
+                                       the keyframe. At inference its forward flip seeds
+                                       the DP head's diffusion (CoA-guided / SDEdit).
           'is_pad'    : (L,)          padding mask for the planner target
           'action_dp' : (dp_chunk, 8) DP-FORWARD executed chunk [a_{idx+1}, ..., a_{idx+dp_chunk}];
                                        steps past the keyframe hold the keyframe pose a_T.
@@ -440,7 +441,7 @@ class RLBenchDataset(Dataset):
 
         # ── CoA planner target: full remaining sub-trajectory in REVERSE order ──
         # Identical to CoA: from current idx up to the keyframe, reversed so that
-        # position 0 = a_T (keyframe). The model takes the first m as the milestone.
+        # position 0 = a_T (keyframe).
         action_seq, is_pad = self.get_action_coa(actions, max_idx, idx)
         sample['action'] = action_seq
         sample['is_pad'] = is_pad
