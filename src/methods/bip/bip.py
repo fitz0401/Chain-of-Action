@@ -1,22 +1,19 @@
 """
-BIP — Bidirectional Policy.
+BIP — Bidirectional Policy (segment + motion-planning hand-off).
 
-A single shared visual backbone feeds two action heads:
+Pipeline (data segmented by gripper-only keyframes; per segment an offline
+variance analysis marks the near-goal low-variance interval [variance_start, keyframe]):
 
-  1. CoA-REVERSE head (planner) — identical to coa.py.
-        Autoregressively generates the full remaining sub-trajectory in REVERSE
-        order (keyframe a_T -> current a_idx).
+  * CoA-REVERSE head (planner): predicts the small-variance terminal segment in
+    REVERSE (keyframe -> interval start). Trained on obs anywhere in the segment;
+    target near-end = max(obs_idx, variance_start).
+  * DP-FORWARD head (controller): plain Diffusion Policy, image-conditioned, predicts
+    the executed forward chunk. Trained only INSIDE the interval (dp_valid mask).
 
-  2. DP-FORWARD head (controller) — identical to dp.py.
-        A conditional diffusion model that predicts the immediate forward chunk
-        [a_{idx+1}, ..., a_{idx+dp_chunk}] actually executed on the robot,
-        conditioned ONLY on the pooled image feature (plain DP — no milestone).
-
-The two heads are trained independently (each with its own loss). They are
-coupled ONLY at inference, through CoA-guided diffusion: while the DP head
-denoises from pure noise, every DDIM step blends the predicted clean sample
-toward the CoA guess for the same chunk (reconstruction guidance). See
-`_coa_guess_chunk` and `Actor.infer_guided`.
+Inference (stateless phase switch):
+  CoA predicts the segment -> its start point. If the current end-effector is far from
+  that start, output the start pose as a single action (RLBench motion-plans there);
+  once close, switch to the DP head's forward chunk.
 """
 
 import torch
@@ -44,37 +41,32 @@ class BIP(BaseMethod):
         encoder_model,          # shared CoA-style spatial image encoder
         coa_actor_model,        # CoA transformer planner
         dp_actor_model,         # DP ConditionalUnet1D controller
-        # optimiser / scheduler
         lr: float,
         lr_backbone: float,
         weight_decay: float,
         num_train_steps: int,
         adaptive_lr: bool,
         actor_grad_clip,
-        # BIP params
         dp_action_sequence: int,
         action_dim: int,
         hidden_dim: int,
         num_diffusion_iters: int,
-        # CoA-guided diffusion (inference only)
-        use_coa_guidance: bool,
-        guidance_strength: float,
-        # CoA params injected at actor construction time
         execute_threshold: float,
         execution_length: int,
         loss_type: str,
         latent_loss_type: str,
+        plan_reach_threshold: float,   # normalized EE distance to switch plan -> DP
+        pad_eps: float,                # ||action|| below this is treated as padding
         *args, **kwargs,
     ):
         super().__init__(*args, **kwargs)
-
-        self.dp_action_sequence = dp_action_sequence
-        self.action_dim         = action_dim
-        self.loss_type          = loss_type
-        self.latent_loss_type   = latent_loss_type
-        self.actor_grad_clip    = actor_grad_clip
-        self.use_coa_guidance   = use_coa_guidance
-        self.guidance_strength  = guidance_strength
+        self.dp_action_sequence   = dp_action_sequence
+        self.action_dim           = action_dim
+        self.loss_type            = loss_type
+        self.latent_loss_type     = latent_loss_type
+        self.actor_grad_clip      = actor_grad_clip
+        self.plan_reach_threshold = plan_reach_threshold
+        self.pad_eps              = pad_eps
 
         self.device = (
             self.accelerator.device
@@ -82,17 +74,17 @@ class BIP(BaseMethod):
             else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
 
-        # ── Shared visual backbone (spatial features for CoA, pooled for DP) ──
+        # ── shared visual backbone ──
         self.encoder = encoder_model().to(self.device)
 
-        # ── CoA planner head (REVERSE, full sub-trajectory) ──────────────────
+        # ── CoA planner head (REVERSE) ──
         self.coa_actor = coa_actor_model(
             action_order="REVERSE",
             execute_threshold=execute_threshold,
             execution_length=execution_length,
         ).to(self.device)
 
-        # ── DP controller head (plain DP: image-conditioned only) ─────────────
+        # ── DP controller head (plain DP: pooled image feature only) ──
         self.dp_visual_proj = nn.Linear(hidden_dim, hidden_dim).to(self.device)
         self.dp_noise_scheduler = DDIMScheduler(
             num_train_timesteps=num_diffusion_iters,
@@ -115,7 +107,6 @@ class BIP(BaseMethod):
 
         self.img_normalizer = tvf.Normalize(mean=VISUAL_OBS_MEAN, std=VISUAL_OBS_STD)
 
-        # ── Unified AdamW (backbone group at lower lr; exclude DP EMA shadow) ──
         param_dicts = [
             {"params": [p for n, p in self.named_parameters()
                         if "backbone" not in n and "ema_actor" not in n and p.requires_grad]},
@@ -129,38 +120,28 @@ class BIP(BaseMethod):
                 "cosine", optimizer=self.opt,
                 num_warmup_steps=100, num_training_steps=num_train_steps,
             )
-
         self.prepare_accelerator()
 
-    # ── Helpers ────────────────────────────────────────────────────────────────
+    # ── helpers ──────────────────────────────────────────────────────────────────
 
-    def _prepare_img(self, batch) -> torch.Tensor:
+    def _prepare_img(self, batch):
         raw = extract_many_from_batch(batch, "rgb")
         img = flatten_time_dim_into_channel_dim(stack_tensor_dictionary(raw, dim=1))
         return self.img_normalizer(img / 255.0)
 
-    def _pool_visual(self, img_feat: torch.Tensor) -> torch.Tensor:
-        # (b, hidden_dim, h, w) -> (b, hidden_dim)
-        return self.dp_visual_proj(img_feat.mean(dim=[-2, -1]))
+    def _pool_visual(self, img_feat):
+        return self.dp_visual_proj(img_feat.mean(dim=[-2, -1]))   # (b, hidden_dim)
 
     @staticmethod
-    def _strip_mtp(a: torch.Tensor) -> torch.Tensor:
+    def _strip_mtp(a):
         return a[:, :, 0, :] if a.dim() == 4 else a
 
-    def _coa_guess_chunk(self, a_hat_coa: torch.Tensor) -> torch.Tensor:
-        """CoA's guess for the DP forward chunk [a_{idx+1}, ..., a_{idx+dp_chunk}].
-
-        a_hat_coa is REVERSE (pos 0 = keyframe a_T, last valid = current a_idx). Flip
-        to forward [a_idx, a_{idx+1}, ...] and drop a_idx (the current action) to align
-        with action_dp. Keyframe-pad the tail if the planner generated fewer steps.
-        """
-        fwd = torch.flip(a_hat_coa, dims=[1])             # [a_idx, a_{idx+1}, ..., a_T]
-        guess = fwd[:, 1:1 + self.dp_action_sequence]     # [a_{idx+1}, ..., a_{idx+dp_chunk}]
-        if guess.shape[1] < self.dp_action_sequence:
-            keyframe = a_hat_coa[:, 0:1]                  # a_T
-            pad = keyframe.expand(-1, self.dp_action_sequence - guess.shape[1], -1)
-            guess = torch.cat([guess, pad], dim=1)
-        return guess
+    def _segment_start(self, a_hat):
+        """Last non-padding REVERSE action = the interval start (furthest from keyframe).
+        a_hat: (b, L, 8) REVERSE (pos 0 = keyframe, trailing positions ~0 = padding)."""
+        n_valid = (a_hat.norm(dim=-1) > self.pad_eps).sum(1).clamp(min=1)   # (b,)
+        last = (n_valid - 1).long()
+        return a_hat[torch.arange(a_hat.shape[0], device=a_hat.device), last]   # (b, 8)
 
     def training_mode(self, training: bool = True):
         self.encoder.train(training)
@@ -168,64 +149,39 @@ class BIP(BaseMethod):
         self.dp_visual_proj.train(training)
         self.dp_actor.train(training)
 
-    # ── Forward ────────────────────────────────────────────────────────────────
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError("BIP uses update() for training and act() for inference.")
 
-    def forward(self, batch, training: bool = True):
+    # ── training ──────────────────────────────────────────────────────────────────
+
+    def update(self, batch: dict) -> dict:
+        self.training_mode(True)
         img      = self._prepare_img(batch)
         proprio  = batch["low_dim_state"]
         task_emb = batch.get("task_emb", None)
 
-        obs_feat = self.encoder(img)          # (img_feat, pos)
+        obs_feat = self.encoder(img)
         img_feat = obs_feat[0]
 
-        if training:
-            action_coa = batch["action"]      # (b, L, 8) REVERSE, pos 0 = keyframe
-            is_pad_coa = batch["is_pad"]       # (b, L)
-            a_hat_coa, x_hat, x_gt = self.coa_actor(
-                obs_feat, proprio, task_emb, action_coa, is_pad_coa, training=True,
-            )
-
-            # plain DP: image-conditioned only
-            dp_features = self._pool_visual(img_feat)
-            noise_pred, noise = self.dp_actor(dp_features, batch["action_dp"])
-            return a_hat_coa, x_hat, x_gt, action_coa, is_pad_coa, noise_pred, noise
-
-        # ── inference ──
-        a_hat_coa, _, _ = self.coa_actor(
-            obs_feat, proprio, task_emb, None, None, training=False,
-        )
-        a_hat_coa = self._strip_mtp(a_hat_coa)
-        dp_features = self._pool_visual(img_feat)
-        if self.use_coa_guidance:
-            # warm-start the diffusion from the CoA guess for this same chunk (SDEdit)
-            guess = self._coa_guess_chunk(a_hat_coa)          # (b, dp_chunk, 8)
-            a_hat_dp = self.dp_actor.infer_guided(
-                dp_features, guess, self.guidance_strength)
-        else:
-            a_hat_dp = self.dp_actor.infer(dp_features)        # (b, dp_chunk, 8)
-        return a_hat_dp, a_hat_coa
-
-    # ── Training update ─────────────────────────────────────────────────────────
-
-    def update(self, batch: dict) -> dict:
-        self.training_mode(True)
-        a_hat_coa, x_hat, x_gt, action_coa, is_pad_coa, noise_pred, noise = \
-            self.forward(batch, training=True)
+        # CoA planner loss (masked L1 + latent)
+        action_coa = batch["action"]
+        is_pad_coa = batch["is_pad"]
+        a_hat_coa, x_hat, x_gt = self.coa_actor(
+            obs_feat, proprio, task_emb, action_coa, is_pad_coa, training=True)
 
         valid = ~is_pad_coa.unsqueeze(-1)
-
-        # CoA action loss (masked, same as coa.py)
         loss_fn = F.l1_loss if self.loss_type == "l1" else F.mse_loss
         coa_elem = loss_fn(a_hat_coa, action_coa, reduction="none") * valid
         coa_loss = coa_elem.sum() / valid.expand_as(coa_elem).sum().clamp(min=1)
-
-        # CoA latent loss (masked, same as coa.py)
         lat_fn = F.l1_loss if self.latent_loss_type == "l1" else F.mse_loss
         lat_elem = lat_fn(x_hat, x_gt, reduction="none") * valid
         latent_loss = lat_elem.sum() / valid.expand_as(lat_elem).sum().clamp(min=1)
 
-        # DP noise loss (same as dp.py)
-        dp_loss = F.mse_loss(noise_pred, noise, reduction="none").mean(-1).mean(-1).mean()
+        # DP controller loss (noise MSE, masked to in-interval samples)
+        noise_pred, noise = self.dp_actor(self._pool_visual(img_feat), batch["action_dp"])
+        dp_se = F.mse_loss(noise_pred, noise, reduction="none").mean(-1).mean(-1)   # (b,)
+        dp_valid = batch["dp_valid"]
+        dp_loss = (dp_se * dp_valid).sum() / dp_valid.sum().clamp(min=1)
 
         total_loss = coa_loss + latent_loss + dp_loss
         total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=100.0, neginf=-100.0)
@@ -235,15 +191,12 @@ class BIP(BaseMethod):
             self.accelerator.backward(total_loss)
         else:
             total_loss.backward()
-
         if self.actor_grad_clip:
             nn.utils.clip_grad_norm_(self.parameters(), self.actor_grad_clip)
-
         self.opt.step()
         if hasattr(self, "lr_scheduler"):
             self.lr_scheduler.step()
 
-        # Keep DP EMA synced so checkpoints are always inference-ready
         self.dp_actor.ema.step(self.dp_actor.actor.parameters())
         self.dp_actor.ema.copy_to(self.dp_actor.ema_actor.parameters())
 
@@ -254,11 +207,28 @@ class BIP(BaseMethod):
             "dp_loss":     dp_loss.detach(),
         }
 
-    # ── Inference ────────────────────────────────────────────────────────────────
+    # ── inference ────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def act(self, batch) -> BatchedActionSequence:
-        """Return the DP forward chunk (CoA-guided diffusion)."""
         self.training_mode(False)
-        a_hat_dp, _ = self.forward(batch, training=False)
-        return a_hat_dp
+        img      = self._prepare_img(batch)
+        proprio  = batch["low_dim_state"]
+        task_emb = batch.get("task_emb", None)
+
+        obs_feat = self.encoder(img)
+        img_feat = obs_feat[0]
+
+        a_hat_coa, _, _ = self.coa_actor(obs_feat, proprio, task_emb, None, None, training=False)
+        a_hat_coa = self._strip_mtp(a_hat_coa)
+        start = self._segment_start(a_hat_coa)                    # (b, 8) interval start pose
+
+        # current end-effector position vs. the segment start (normalized space)
+        cur = proprio[:, -1] if proprio.dim() == 3 else proprio   # (b, dim)
+        dist = (cur[:, :3] - start[:, :3]).norm(dim=-1)           # (b,)
+
+        if bool((dist > self.plan_reach_threshold).any()):
+            # PLAN phase: hand the start pose to the env's motion planner (one step)
+            return start.unsqueeze(1)                             # (b, 1, 8)
+        # CONTROL phase: DP forward chunk
+        return self.dp_actor.infer(self._pool_visual(img_feat))  # (b, dp_chunk, 8)

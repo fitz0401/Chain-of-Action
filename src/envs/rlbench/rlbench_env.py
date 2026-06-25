@@ -224,7 +224,8 @@ def _is_stopped(demo, i, obs, stopped_buffer, delta=0.1):
 
 
 def keypoint_discovery(
-    demo: Demo, stopping_delta: float = 0.01, method: str = "heuristic"
+    demo: Demo, stopping_delta: float = 0.01, method: str = "heuristic",
+    gripper_only: bool = False,
 ) -> list[int]:
     """Discover next-best-pose keypoints in a demonstration based on specified method.
 
@@ -249,9 +250,10 @@ def keypoint_discovery(
             stopped = _is_stopped(demo, i, obs, stopped_buffer, stopping_delta)
             stopped_buffer = 4 if stopped else stopped_buffer - 1
             # If change in gripper, or end of episode.
+            # gripper_only: ignore the low-velocity "stopped" criterion (BIP).
             last = i == (len(demo) - 1)
             if i != 0 and (obs.gripper_open != prev_gripper_open or
-                           last or stopped):
+                           last or (stopped and not gripper_only)):
                 episode_keypoints.append(i)
             prev_gripper_open = obs.gripper_open
         if len(episode_keypoints) > 1 and (episode_keypoints[-1] - 1) == \
@@ -538,16 +540,10 @@ class RLBenchEnvFactory(EnvFactory):
                         action_order="REVERSE"
                     )
                 elif cfg.method_name == "bip":
-                    # BIP act() returns dp_action_sequence (e.g. 20) actions, not the
-                    # CoA variable sequence length stored in cfg.action_sequence.
-                    env = TemporalEnsemble(
-                        env,
-                        cfg.method.dp_action_sequence,
-                        cfg.env.episode_length,
-                        cfg.execution_length,
-                        cfg.temporal_ensemble,
-                        cfg.temporal_ensemble_gain,
-                    )
+                    # BIP act() returns a variable-length action: a single planned pose
+                    # (move-to-segment-start phase) or a DP chunk (control phase). A plain
+                    # ActionSequence executes whatever it is, open-loop, then re-plans.
+                    env = ActionSequence(env, cfg.method.dp_action_sequence)
                 else:
                     env = TemporalEnsemble(
                         env,
@@ -655,10 +651,15 @@ class RLBenchEnvFactory(EnvFactory):
             )
 
         # Split each trajectory into a list of sub-trajectories according to the keyframe action.
-        if cfg.method_name in ("coa", "bip"):
-            # BIP uses the same keyframe-split data as CoA.
+        bip_seg_idx = None
+        if cfg.method_name == "coa":
             demos = self._traj_split(raw_demos)
             action_sequence = self._update_action_sequence_length(cfg, demos)
+        elif cfg.method_name == "bip":
+            # BIP: gripper-only keyframe split + offline variance interval marking.
+            demos, bip_seg_idx = self._traj_split_indexed(
+                raw_demos, gripper_only=cfg.method.gripper_only_keyframe)
+            action_sequence = None  # set after conversion (needs denormalized poses)
         else:
             demos = raw_demos
             action_sequence = cfg.action_sequence
@@ -682,6 +683,8 @@ class RLBenchEnvFactory(EnvFactory):
         '''
         demos_to_load = self._convert_demos_to_loaded_format(demos, cfg)
 
+        if cfg.method_name == "bip":
+            action_sequence = self._mark_variance_start(demos_to_load, bip_seg_idx, cfg)
 
         return demos_to_load, action_sequence
 
@@ -726,10 +729,83 @@ class RLBenchEnvFactory(EnvFactory):
             for idx in range(len(episode_keypoints)-1):
                 next_idx = idx + 1
                 nbp_demo = demo[episode_keypoints[idx]:episode_keypoints[next_idx]+1]
-                # nbp_demo[-1].grippe  r_open = nbp_demo[-2].gripper_open 
+                # nbp_demo[-1].grippe  r_open = nbp_demo[-2].gripper_open
                 nbp_demos.append(nbp_demo)
         return nbp_demos
-    
+
+    def _traj_split_indexed(self, demos, gripper_only=True):
+        """Like _traj_split but keyframes are split by GRIPPER state only (BIP), and
+        the segment index within each demo is tracked alongside each sub-trajectory."""
+        segments, seg_idx = [], []
+        for demo in demos:
+            episode_keypoints = keypoint_discovery(demo, gripper_only=gripper_only)
+            if episode_keypoints[0] < 10:
+                assert len(episode_keypoints) > 1
+                episode_keypoints[0] = 0
+            else:
+                episode_keypoints = [0, ] + episode_keypoints
+            for idx in range(len(episode_keypoints) - 1):
+                segments.append(demo[episode_keypoints[idx]:episode_keypoints[idx + 1] + 1])
+                seg_idx.append(idx)
+        return segments, seg_idx
+
+    def _mark_variance_start(self, demos, seg_idx, cfg):
+        """Offline (BIP): per segment-index, find the near-goal low-variance interval.
+
+        Each segment's EE positions are expressed in the keyframe's SE(3) frame
+        (translate + rotate by the inverse keyframe orientation). For each offset k
+        from the keyframe, the spatial variance of that aligned position across all
+        demos sharing the segment index is computed; walking outward from the goal,
+        the interval ends at the first offset whose variance exceeds
+        `variance_threshold` (floored at `min_interval_length`). Each segment is
+        annotated with 'variance_start' (the index where its small-variance region
+        begins). Returns the max CoA target length (= action_sequence for CoA head).
+        """
+        from collections import defaultdict
+        key = getattr(ActionModeType, cfg.env.action_mode).value
+        action_space = self.get_action_space(cfg)
+        min_len = int(cfg.method.min_interval_length)
+        thr = float(cfg.method.variance_threshold)
+
+        # EE positions in each segment's keyframe frame (full SE(3) normalization)
+        local_pos = []
+        for d in demos:
+            raw = MinMaxNorm.denormalize(np.asarray(d[key], dtype=np.float32), action_space)
+            R_kf = R.from_quat(raw[-1, 3:7])
+            local_pos.append(R_kf.inv().apply(raw[:, :3] - raw[-1, :3]))   # (T, 3)
+
+        groups = defaultdict(list)
+        for i, n in enumerate(seg_idx):
+            groups[n].append(i)
+
+        interval_len = {}
+        for n, members in groups.items():
+            max_k = min(len(local_pos[i]) for i in members) - 1
+            l_var = 0
+            for k in range(1, max_k + 1):
+                pts = np.stack([local_pos[i][-1 - k] for i in members], axis=0)  # (M, 3)
+                if pts.var(axis=0).sum() <= thr:
+                    l_var = k
+                else:
+                    break
+            interval_len[n] = max(min_len, l_var)
+
+        max_target = 1
+        seg_lens = []
+        for i, n in enumerate(seg_idx):
+            T = len(demos[i][key])
+            vstart = max(0, (T - 1) - interval_len[n])
+            # stored full length so get_observation's per-key indexing stays valid
+            demos[i]['variance_start'] = np.full((T,), vstart, dtype=np.int64)
+            target = (T - 1) - vstart + 1
+            seg_lens.append(T)
+            max_target = max(max_target, target)
+        print(f"[BIP] {len(demos)} segments; interval_len per seg-index="
+              f"{ {k: interval_len[k] for k in sorted(interval_len)} }; "
+              f"seg_len[min/mean/max]={min(seg_lens)}/{int(np.mean(seg_lens))}/{max(seg_lens)}; "
+              f"CoA action_sequence={max_target}")
+        return max_target
+
 
     def _convert_demos_to_loaded_format(self, 
         raw_demos, cfg=None

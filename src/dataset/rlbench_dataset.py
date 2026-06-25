@@ -415,53 +415,60 @@ class RLBenchDataset(Dataset):
 
     def get_sample_bip(self, episode_idx: int) -> dict:
         """
-        Dataset sample for BIP.
+        Dataset sample for BIP (CoA reverse planner + DP forward controller, both
+        restricted to the small-variance near-goal interval [variance_start, keyframe]).
 
         Keys returned:
-          'action'    : (L, 8)        CoA-REVERSE planner target — full remaining
-                                       sub-trajectory [a_T, a_{T-1}, ..., a_idx] padded
-                                       to L = max sub-trajectory length. Position 0 is
-                                       the keyframe. At inference its forward flip seeds
-                                       the DP head's diffusion (CoA-guided / SDEdit).
-          'is_pad'    : (L,)          padding mask for the planner target
-          'action_dp' : (dp_chunk, 8) DP-FORWARD executed chunk [a_{idx+1}, ..., a_{idx+dp_chunk}];
-                                       steps past the keyframe hold the keyframe pose a_T.
+          'action'   : (L, 8)        CoA-REVERSE target = [a_keyframe, ..., a_near_end]
+                                      padded to L (= action_sequence). near_end =
+                                      max(idx, variance_start): outside the interval CoA
+                                      predicts down to the interval start; inside, down to
+                                      the current obs.
+          'is_pad'   : (L,)          padding mask for the CoA target.
+          'action_dp': (dp_chunk, 8) DP-FORWARD chunk [a_{idx+1}, ..., a_{idx+dp_chunk}],
+                                      keyframe-held past the end.
+          'dp_valid' : ()            1.0 if obs is inside the interval (idx >= variance_start),
+                                      else 0.0 — DP loss is masked outside the interval.
         """
         episode = self._demos[episode_idx]
 
-        actions = episode[ActionModeType[self.cfg.env.action_mode].value]
+        key = ActionModeType[self.cfg.env.action_mode].value
+        actions = episode[key]
         ep_len  = len(actions)
         max_idx = ep_len - 1
+        vstart  = int(episode['variance_start'][0])
+        dp_chunk = self.cfg.method.dp_action_sequence
+        inside_p = self.cfg.method.dp_sample_inside_prob
 
-        idx = 0 if (self.cfg.debug or ep_len <= 1) else np.random.randint(0, max_idx)
+        # sample obs idx anywhere in the segment; bias toward the interval so the DP
+        # head gets enough in-interval supervision (CoA obs is unrestricted by design).
+        if self.cfg.debug or ep_len <= 1:
+            idx = 0
+        elif vstart < max_idx and np.random.rand() < inside_p:
+            idx = np.random.randint(vstart, max_idx)
+        else:
+            idx = np.random.randint(0, max_idx)
 
         sample = self.get_observation(episode, idx)
 
-        dp_chunk = self.cfg.method.dp_action_sequence
-
-        # ── CoA planner target: full remaining sub-trajectory in REVERSE order ──
-        # Identical to CoA: from current idx up to the keyframe, reversed so that
-        # position 0 = a_T (keyframe).
-        action_seq, is_pad = self.get_action_coa(actions, max_idx, idx)
+        # CoA reverse target: keyframe -> max(idx, variance_start)
+        near_end = max(idx, vstart)
+        action_seq, is_pad = self.get_action_coa(actions, max_idx, near_end)
         sample['action'] = action_seq
         sample['is_pad'] = is_pad
 
-        # ── DP controller target: FORWARD chunk [a_{idx+1}, ..., a_{idx+dp_chunk}] ──
-        # Beyond the keyframe, HOLD the keyframe pose a_T (not zeros) so the controller
-        # drives to the goal and stays — zeros would denormalize to a center pose and,
-        # since temporal ensembling only filters exactly-zero entries, drag the executed
-        # action away from the keyframe (a jump/drift right at the keyframe).
-        keyframe_action = actions[max_idx]
+        # DP forward chunk from idx, keyframe-held past the end
         fwd = np.zeros((dp_chunk, actions.shape[-1]), dtype=np.float32)
         for i in range(dp_chunk):
-            t = idx + 1 + i
-            fwd[i] = actions[t] if t < ep_len else keyframe_action
+            fwd[i] = actions[min(idx + 1 + i, max_idx)]
         sample['action_dp'] = fwd
+        sample['dp_valid'] = np.float32(1.0 if idx >= vstart else 0.0)
 
         if self.cfg.method.use_lang_cond:
             sample['desc'] = sample['desc'].squeeze(0)
 
-        del sample[ActionModeType[self.cfg.env.action_mode].value]
+        del sample[key]
+        del sample['variance_start']          # offline marker, not a model input
         sample = self.convert_dtype(sample)
         return sample
 

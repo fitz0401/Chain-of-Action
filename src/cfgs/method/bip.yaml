@@ -1,37 +1,44 @@
 # @package _global_
 #
-# BIP — Bidirectional Policy
+# BIP — Bidirectional Policy (segment + motion-planning hand-off).
 #
-# Shared visual backbone -> two INDEPENDENT heads:
-#   CoA-REVERSE planner : original CoA, generates the full remaining sub-trajectory
-#                         in REVERSE order (keyframe -> current).
-#   DP-FORWARD control  : plain original DP, predicts the executed chunk conditioned
-#                         only on the pooled image feature.
-# The heads are coupled ONLY at inference, via CoA-guided diffusion (SDEdit).
+# Offline: split demos by GRIPPER-ONLY keyframes; per segment-index, normalize each
+# segment into the keyframe SE(3) frame and find the near-goal low-variance interval
+# (variance < variance_threshold, floored at min_interval_length). Mark variance_start.
 #
-# Uses the same keyframe-split data as CoA.
+# Train (both heads only on the interval [variance_start, keyframe], shared encoder):
+#   CoA-REVERSE planner : predicts keyframe -> max(obs_idx, variance_start).
+#   DP-FORWARD control  : plain DP, image-conditioned, masked to in-interval samples.
+#
+# Inference: CoA -> segment start; motion-plan to it (RLBench planner); switch to DP.
 
 method_name: bip
-action_sequence: variable     # resolved at runtime to max sub-trajectory length
+action_sequence: variable     # resolved at runtime to max CoA target length (interval)
 num_train_steps: 20000
 
 method:
   _target_: src.methods.bip.BIP
 
-  # ── BIP head params ──────────────────────────────────────────────────────────
+  # ── segmentation / variance interval (offline) ──
+  gripper_only_keyframe: true    # keyframes from gripper state changes only (no velocity-0)
+  min_interval_length: 20        # interval floor (default = DP chunk length)
+  # SE(3)-aligned position variance (m^2, sum of 3 axes) cut-off — THE knob that sets
+  # how much of the near-goal segment is "low variance". Smaller -> shorter interval.
+  # Calibrate against the "[BIP] ... interval_len per seg-index=..." line printed at load.
+  variance_threshold: 0.002
+
+  # ── DP controller ──
   dp_action_sequence: 20         # executed forward chunk length (divisible by 4)
+  dp_sample_inside_prob: 0.5     # P(sample obs inside the interval) for DP supervision
   action_dim: 8
   hidden_dim: 512
   num_diffusion_iters: 50
 
-  # CoA-guided diffusion (inference only): denoise from pure noise but, at every DDIM
-  # step, blend the predicted clean sample toward the CoA guess for the same chunk
-  # (reconstruction guidance). guidance_strength in [0,1] is the per-step blend weight:
-  # 0.0 == plain DP, 1.0 == lock x0 to the CoA plan each step.
-  use_coa_guidance: true
-  guidance_strength: 0.3
+  # ── inference hand-off ──
+  plan_reach_threshold: 0.05     # normalized EE distance to switch plan -> DP
+  pad_eps: 0.3                   # ||action|| below this is padding (segment-start detect)
 
-  # ── Optimiser ────────────────────────────────────────────────────────────────
+  # ── optimiser ──
   lr: 1e-4
   lr_backbone: 1e-5
   weight_decay: 1e-4
@@ -39,13 +46,13 @@ method:
   adaptive_lr: true
   actor_grad_clip: 1.0
 
-  # ── CoA loss types ───────────────────────────────────────────────────────────
+  # ── CoA losses ──
   loss_type: l1
   latent_loss_type: l1
   execute_threshold: 0.01
   execution_length: ${execution_length}
 
-  # ── Fields consumed by dataset / env factory (mirror CoA) ──────────────────────
+  # ── fields consumed by dataset / env factory ──
   action_order: REVERSE
   action_padding: zero
   mtp: false
@@ -54,7 +61,7 @@ method:
   action_mode: ${env.action_mode}
   use_lang_cond: false
 
-  # ── Shared image encoder (CoA spatial encoder) ─────────────────────────────────
+  # ── shared image encoder (CoA spatial encoder) ──
   encoder_model:
     _target_: src.methods.coa.coa.ImageEncoder
     _partial_: true
@@ -68,12 +75,11 @@ method:
     use_frozen_bn: true
     use_lang_cond: false
 
-  # ── CoA planner actor (REVERSE, full sequence) ─────────────────────────────────
-  # action_order / execute_threshold / execution_length injected in BIP.__init__
+  # ── CoA planner actor (REVERSE) ──
   coa_actor_model:
     _target_: src.methods.coa.coa.ActorModel
     _partial_: true
-    num_queries: ${action_sequence}   # runtime-resolved max sub-trajectory length
+    num_queries: ${action_sequence}
     hidden_dim: ${method.hidden_dim}
     enc_layers: 4
     dec_layers: 6
@@ -86,7 +92,7 @@ method:
     action_dim: ${method.action_dim}
     use_lang_cond: false
 
-  # ── DP controller UNet (input_shapes / output_shape injected at runtime) ───────
+  # ── DP controller UNet ──
   dp_actor_model:
     _target_: src.models.diffusion_models.ConditionalUnet1D
     _partial_: true
