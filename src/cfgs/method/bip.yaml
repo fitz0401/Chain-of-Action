@@ -1,42 +1,37 @@
 # @package _global_
 #
-# BIP — Bidirectional Policy (segment + motion-planning hand-off).
+# BIP — Bidirectional Policy (stop_head redesign).
 #
-# Offline: split demos by GRIPPER-ONLY keyframes; per segment-index, normalize each
-# segment into the keyframe SE(3) frame and find the near-goal low-variance interval
-# (variance < variance_threshold, floored at min_interval_length). Mark variance_start.
+# Offline: split demos by GRIPPER-ONLY keyframes; per segment-index, compute the
+# cross-demo SE(3)-normalised variance curve σ²(k) and auto-detect its inflection
+# point (2nd-order difference peak, or PELT if ruptures is installed) → stop_k.
+# No manual threshold — the inflection is data-driven.
 #
-# Train (both heads only on the interval [variance_start, keyframe], shared encoder):
-#   CoA-REVERSE planner : predicts keyframe -> max(obs_idx, variance_start).
-#   DP-FORWARD control  : plain DP, image-conditioned, masked to in-interval samples.
+# Train (full segment, shared encoder):
+#   CoA-REVERSE planner : full segment [keyframe → start] as reverse target.
+#   stop_head           : Linear(action_dim → 1), BCE on positions 0 … stop_k.
+#   Loss = L_action(L1) + L_latent(L1) + λ_stop · L_stop(BCE)
 #
-# Inference: CoA -> segment start; motion-plan to it (RLBench planner); switch to DP.
+# Inference (closed-loop, re-plan every step):
+#   CoA reverse AR → stop_head sigmoid → first p > stop_threshold → execute → re-plan.
 
 method_name: bip
-action_sequence: variable     # resolved at runtime to max CoA target length (interval)
+action_sequence: variable     # resolved at runtime to max segment length
 num_train_steps: 20000
 
 method:
   _target_: src.methods.bip.BIP
 
-  # ── segmentation / variance interval (offline) ──
-  gripper_only_keyframe: true    # keyframes from gripper state changes only (no velocity-0)
-  min_interval_length: 20        # interval floor (default = DP chunk length)
-  # SE(3)-aligned position variance (m^2, sum of 3 axes) cut-off — THE knob that sets
-  # how much of the near-goal segment is "low variance". Smaller -> shorter interval.
-  # Calibrate against the "[BIP] ... interval_len per seg-index=..." line printed at load.
-  variance_threshold: 0.002
+  # ── stop_head ──
+  lambda_stop: 1.0            # weight of BCE stop loss
+  stop_threshold: 0.5         # sigmoid cut-off for inference stop detection
+  plan_reach_threshold: 0.05  # normalised EE dist: far→motion-plan to start, close→fwd chunk
+  chunk_size: 4               # actions returned per act() call (action chunking)
 
-  # ── DP controller ──
-  dp_action_sequence: 20         # executed forward chunk length (divisible by 4)
-  dp_sample_inside_prob: 0.5     # P(sample obs inside the interval) for DP supervision
+  # ── action / model dims ──
   action_dim: 8
   hidden_dim: 512
-  num_diffusion_iters: 50
-
-  # ── inference hand-off ──
-  plan_reach_threshold: 0.05     # normalized EE distance to switch plan -> DP
-  pad_eps: 0.3                   # ||action|| below this is padding (segment-start detect)
+  execution_length: ${execution_length}
 
   # ── optimiser ──
   lr: 1e-4
@@ -49,8 +44,6 @@ method:
   # ── CoA losses ──
   loss_type: l1
   latent_loss_type: l1
-  execute_threshold: 0.01
-  execution_length: ${execution_length}
 
   # ── fields consumed by dataset / env factory ──
   action_order: REVERSE
@@ -60,6 +53,7 @@ method:
   full_traj_training: false
   action_mode: ${env.action_mode}
   use_lang_cond: false
+  gripper_only_keyframe: true  # keyframes from gripper state changes only
 
   # ── shared image encoder (CoA spatial encoder) ──
   encoder_model:
@@ -75,7 +69,7 @@ method:
     use_frozen_bn: true
     use_lang_cond: false
 
-  # ── CoA planner actor (REVERSE) ──
+  # ── CoA REVERSE planner ──
   coa_actor_model:
     _target_: src.methods.coa.coa.ActorModel
     _partial_: true
@@ -91,13 +85,3 @@ method:
     state_dim: 8
     action_dim: ${method.action_dim}
     use_lang_cond: false
-
-  # ── DP controller UNet ──
-  dp_actor_model:
-    _target_: src.models.diffusion_models.ConditionalUnet1D
-    _partial_: true
-    sequence_length: ${method.dp_action_sequence}
-    diffusion_step_embed_dim: 256
-    down_dims: [256, 512, 1024]
-    kernel_size: 5
-    n_groups: 8

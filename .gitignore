@@ -87,3 +87,4 @@ wandb/
 src/test/
 ckpts/
 src/dino/
+plots/

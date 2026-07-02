@@ -74,6 +74,25 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
+
+def _find_stop_k(curve: np.ndarray) -> int:
+    """Auto-detect the inflection point of a σ²(k) variance curve via PELT.
+
+    Returns the offset k from the keyframe where variance starts rising sharply.
+    Falls back to 2nd-order difference peak only when PELT finds no valid breakpoint.
+    """
+    import ruptures as rpt
+    n = len(curve)
+    if n < 4:
+        return max(1, n // 2)
+    bkps = rpt.Pelt(model="rbf", min_size=2, jump=1).fit(
+        curve.reshape(-1, 1)).predict(pen=0.3)
+    if bkps and 0 < bkps[0] < n:
+        return int(bkps[0])
+    d2 = np.diff(curve, n=2)
+    return min(int(np.argmax(d2)) + 2, n - 1)
+
+
 class ActionModeType(Enum):
     ABS_END_EFFECTOR_POSE = "abs_ee_pose"
     ABS_JOINT_POSITION = "abs_joint_pos"
@@ -540,10 +559,8 @@ class RLBenchEnvFactory(EnvFactory):
                         action_order="REVERSE"
                     )
                 elif cfg.method_name == "bip":
-                    # BIP act() returns a variable-length action: a single planned pose
-                    # (move-to-segment-start phase) or a DP chunk (control phase). A plain
-                    # ActionSequence executes whatever it is, open-loop, then re-plans.
-                    env = ActionSequence(env, cfg.method.dp_action_sequence)
+                    # BIP returns chunk_size actions per call (action chunking).
+                    env = ActionSequence(env, cfg.method.chunk_size)
                 else:
                     env = TemporalEnsemble(
                         env,
@@ -684,7 +701,7 @@ class RLBenchEnvFactory(EnvFactory):
         demos_to_load = self._convert_demos_to_loaded_format(demos, cfg)
 
         if cfg.method_name == "bip":
-            action_sequence = self._mark_variance_start(demos_to_load, bip_seg_idx, cfg)
+            action_sequence = self._mark_stop_labels(demos_to_load, bip_seg_idx, cfg)
 
         return demos_to_load, action_sequence
 
@@ -749,25 +766,27 @@ class RLBenchEnvFactory(EnvFactory):
                 seg_idx.append(idx)
         return segments, seg_idx
 
-    def _mark_variance_start(self, demos, seg_idx, cfg):
-        """Offline (BIP): per segment-index, find the near-goal low-variance interval.
+    def _mark_stop_labels(self, demos, seg_idx, cfg):
+        """Offline (BIP): auto-detect the interaction-start boundary per segment-index.
 
-        Each segment's EE positions are expressed in the keyframe's SE(3) frame
-        (translate + rotate by the inverse keyframe orientation). For each offset k
-        from the keyframe, the spatial variance of that aligned position across all
-        demos sharing the segment index is computed; walking outward from the goal,
-        the interval ends at the first offset whose variance exceeds
-        `variance_threshold` (floored at `min_interval_length`). Each segment is
-        annotated with 'variance_start' (the index where its small-variance region
-        begins). Returns the max CoA target length (= action_sequence for CoA head).
+        For each segment-index, EE positions are normalised into the keyframe SE(3)
+        frame and cross-demo σ²(k) is computed for k = 0 (keyframe) … max_k
+        (segment start). The inflection point of σ²(k) — found via 2nd-order
+        difference peak or PELT (if *ruptures* is installed) — is used as stop_k:
+        the step at which the policy should stop generating and hand over to
+        closed-loop execution.
+
+        Each segment is annotated with:
+          'stop_k'  : int — offset from keyframe of the interaction start.
+
+        Returns max_target = max segment length (= action_sequence; BIP trains on
+        the full segment, and stop_head learns the boundary).
         """
         from collections import defaultdict
         key = getattr(ActionModeType, cfg.env.action_mode).value
         action_space = self.get_action_space(cfg)
-        min_len = int(cfg.method.min_interval_length)
-        thr = float(cfg.method.variance_threshold)
 
-        # EE positions in each segment's keyframe frame (full SE(3) normalization)
+        # SE(3)-normalised EE positions (denorm → real-world → keyframe frame)
         local_pos = []
         for d in demos:
             raw = MinMaxNorm.denormalize(np.asarray(d[key], dtype=np.float32), action_space)
@@ -778,32 +797,29 @@ class RLBenchEnvFactory(EnvFactory):
         for i, n in enumerate(seg_idx):
             groups[n].append(i)
 
-        interval_len = {}
+        stop_k_per_idx = {}
+        sigma2_per_idx = {}
         for n, members in groups.items():
             max_k = min(len(local_pos[i]) for i in members) - 1
-            l_var = 0
-            for k in range(1, max_k + 1):
-                pts = np.stack([local_pos[i][-1 - k] for i in members], axis=0)  # (M, 3)
-                if pts.var(axis=0).sum() <= thr:
-                    l_var = k
-                else:
-                    break
-            interval_len[n] = max(min_len, l_var)
+            curve = np.array([
+                np.stack([local_pos[i][-1 - k] for i in members]).var(axis=0).sum()
+                for k in range(max_k + 1)
+            ])
+            stop_k_per_idx[n] = _find_stop_k(curve)
+            sigma2_per_idx[n]  = curve
 
-        max_target = 1
-        seg_lens = []
+        max_target, seg_lens = 1, []
         for i, n in enumerate(seg_idx):
             T = len(demos[i][key])
-            vstart = max(0, (T - 1) - interval_len[n])
-            # stored full length so get_observation's per-key indexing stays valid
-            demos[i]['variance_start'] = np.full((T,), vstart, dtype=np.int64)
-            target = (T - 1) - vstart + 1
+            # stored as a length-T array so get_observation can index it normally
+            demos[i]['stop_k'] = np.full((T,), stop_k_per_idx[n], dtype=np.int64)
             seg_lens.append(T)
-            max_target = max(max_target, target)
-        print(f"[BIP] {len(demos)} segments; interval_len per seg-index="
-              f"{ {k: interval_len[k] for k in sorted(interval_len)} }; "
+            max_target = max(max_target, T)
+
+        print(f"[BIP] {len(demos)} segments; "
+              f"stop_k per seg-index={ {k: stop_k_per_idx[k] for k in sorted(stop_k_per_idx)} }; "
               f"seg_len[min/mean/max]={min(seg_lens)}/{int(np.mean(seg_lens))}/{max(seg_lens)}; "
-              f"CoA action_sequence={max_target}")
+              f"action_sequence={max_target}")
         return max_target
 
 

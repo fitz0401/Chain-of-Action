@@ -88,6 +88,27 @@ subset_tasks = [
     "take_lid_off_saucepan"
 ]
 
+rlbench_18_tasks = [
+    "open_drawer",
+    "close_drawer",
+    "open_jar",
+    "close_jar",
+    "insert_onto_square_peg",
+    "stack_blocks",
+    "place_cups",
+    "place_shape_in_shape_sorter",
+    "put_groceries_in_cupboard",
+    "put_item_in_drawer",
+    "put_money_in_safe",
+    "push_buttons",
+    "reach_and_drag",
+    "slide_block_to_target",
+    "sweep_to_dustpan",
+    "turn_tap",
+    "light_bulb_in",
+    "meat_off_grill",
+]
+
 def download_task_files(task_name: str, save_dir: str, train_episodes: int, eval_episodes: int,
                        repo_id: str = "Solomonz/chain-of-action") -> bool:
     """
@@ -197,6 +218,7 @@ def main():
     parser.add_argument("--train-episodes", type=int, default=100, help="Number of train episodes (default: 100)")
     parser.add_argument("--eval-episodes", type=int, default=25, help="Number of eval episodes (default: 25)")
     parser.add_argument("--subset", action="store_true", help="Download only subset tasks")
+    parser.add_argument("--rlbench18", action="store_true", help="Download the 18-task RLBench benchmark")
     parser.add_argument("--save-dir", type=str, default="data/rlbench", help="Directory to save datasets")
     parser.add_argument("--repo-id", type=str, default="Solomonz/chain-of-action", 
                        help="HuggingFace repository ID")
@@ -217,6 +239,9 @@ def main():
     elif args.subset:
         tasks_to_download = subset_tasks
         print(f"Downloading subset tasks ({len(tasks_to_download)} tasks)")
+    elif args.rlbench18:
+        tasks_to_download = rlbench_18_tasks
+        print(f"Downloading RLBench-18 benchmark tasks ({len(tasks_to_download)} tasks)")
     else:
         tasks_to_download = all_tasks
         print(f"Downloading all tasks ({len(tasks_to_download)} tasks)")
